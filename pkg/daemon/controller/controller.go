@@ -249,6 +249,7 @@ func (c *CtrlHub) handleLocalNetworkDeviceEvent() error {
 	go func() {
 		for {
 			linkCh := make(chan netlink.LinkUpdate, LinkUpdateChainSize)
+			doneCh := make(chan struct{})
 			exitCh := make(chan struct{})
 
 			errorCallback := func(err error) {
@@ -256,7 +257,7 @@ func (c *CtrlHub) handleLocalNetworkDeviceEvent() error {
 				close(exitCh)
 			}
 
-			if err := netlink.LinkSubscribeWithOptions(linkCh, nil, netlink.LinkSubscribeOptions{
+			if err := netlink.LinkSubscribeWithOptions(linkCh, doneCh, netlink.LinkSubscribeOptions{
 				Namespace:     &hostNetNs,
 				ErrorCallback: errorCallback,
 			}); err != nil {
@@ -277,6 +278,7 @@ func (c *CtrlHub) handleLocalNetworkDeviceEvent() error {
 						c.ipInstanceTriggerSourceForHostLink.Trigger()
 					}
 				case <-exitCh:
+					close(doneCh)
 					break linkLoop
 				}
 			}
@@ -286,6 +288,7 @@ func (c *CtrlHub) handleLocalNetworkDeviceEvent() error {
 	go func() {
 		for {
 			addrCh := make(chan netlink.AddrUpdate, AddrUpdateChainSize)
+			doneCh := make(chan struct{})
 			exitCh := make(chan struct{})
 
 			errorCallback := func(err error) {
@@ -293,7 +296,7 @@ func (c *CtrlHub) handleLocalNetworkDeviceEvent() error {
 				close(exitCh)
 			}
 
-			if err := netlink.AddrSubscribeWithOptions(addrCh, nil, netlink.AddrSubscribeOptions{
+			if err := netlink.AddrSubscribeWithOptions(addrCh, doneCh, netlink.AddrSubscribeOptions{
 				Namespace:     &hostNetNs,
 				ErrorCallback: errorCallback,
 			}); err != nil {
@@ -319,6 +322,7 @@ func (c *CtrlHub) handleLocalNetworkDeviceEvent() error {
 						c.nodeInfoTriggerSourceForHostAddr.Trigger()
 					}
 				case <-exitCh:
+					close(doneCh)
 					break addrLoop
 				}
 			}
@@ -426,6 +430,7 @@ func (c *CtrlHub) handleVxlanInterfaceNeighEvent() error {
 			}
 
 			neighCh := make(chan netlink.NeighUpdate, NeighUpdateChanSize)
+			doneCh := make(chan struct{})
 			exitCh := make(chan struct{})
 
 			errorCallback := func(err error) {
@@ -433,7 +438,7 @@ func (c *CtrlHub) handleVxlanInterfaceNeighEvent() error {
 				close(exitCh)
 			}
 
-			if err := netlink.NeighSubscribeWithOptions(neighCh, nil, netlink.NeighSubscribeOptions{
+			if err := netlink.NeighSubscribeWithOptions(neighCh, doneCh, netlink.NeighSubscribeOptions{
 				Namespace:     &hostNetNs,
 				ErrorCallback: errorCallback,
 			}); err != nil {
@@ -466,6 +471,7 @@ func (c *CtrlHub) handleVxlanInterfaceNeighEvent() error {
 						c.logger.Error(err, "failed to clear vxlan expired neigh caches")
 					}
 				case <-exitCh:
+					close(doneCh)
 					break neighLoop
 				}
 			}
