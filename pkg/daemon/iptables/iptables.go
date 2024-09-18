@@ -1,12 +1,9 @@
 /*
  Copyright 2021 The Hybridnet Authors.
-
  Licensed under the Apache License, Version 2.0 (the "License");
  you may not use this file except in compliance with the License.
  You may obtain a copy of the License at
-
      http://www.apache.org/licenses/LICENSE-2.0
-
  Unless required by applicable law or agreed to in writing, software
  distributed under the License is distributed on an "AS IS" BASIS,
  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,9 +16,8 @@ package iptables
 import (
 	"bytes"
 	"fmt"
-	"net"
-
 	"github.com/alibaba/hybridnet/pkg/daemon/containernetwork"
+	"net"
 
 	"github.com/alibaba/hybridnet/pkg/daemon/ipset"
 	extraliptables "github.com/coreos/go-iptables/iptables"
@@ -39,16 +35,28 @@ const (
 	ChainPreRouting  = "PREROUTING"
 	ChainForward     = "FORWARD"
 
-	ChainHybridnetPostRouting = "HYBRIDNET-POSTROUTING"
-	ChainHybridnetForward     = "HYBRIDNET-FORWARD"
-	ChainHybridnetPreRouting  = "HYBRIDNET-PREROUTING"
+	CustomChainPrefix = "HYBRIDNET-"
 
-	HybridnetOverlayNetSetName = "HYBRIDNET-OVERLAY-NET"
-	HybridnetAllIPSetName      = "HYBRIDNET-ALL"
-	HybridnetNodeIPSetName     = "HYBRIDNET-NODE-IP"
+	ChainHybridnetPostRouting = CustomChainPrefix + "POSTROUTING"
+	ChainHybridnetForward     = CustomChainPrefix + "FORWARD"
+	ChainHybridnetPreRouting  = CustomChainPrefix + "PREROUTING"
+
+	ChainHybridnetFromRuleSkip         = CustomChainPrefix + "FROM-RULE-SKIP"
+	ChainHybridnetPodToNodeTrafficMark = CustomChainPrefix + "POD-TO-NODE-MARK"
+
+	HybridnetOverlayNetSetName       = "HYBRIDNET-OVERLAY-NET"
+	HybridnetAllIPSetName            = "HYBRIDNET-ALL"
+	HybridnetNodeIPSetName           = "HYBRIDNET-NODE-IP"
+	HybridnetLocalPodIPSetName       = "HYBRIDNET-LOCAL-POD-IP"
+	HybridnetLocalUnderlayNetSetName = "HYBRIDNET-LOCAL-UNDERLAY-NET"
 
 	PodToNodeBackTrafficMarkString = "0x20"
+	FullNATedPodTrafficMarkString  = "0x40"
 	PodToNodeBackTrafficMark       = 0x20
+	FullNATedPodTrafficMark        = 0x40
+
+	KubeProxyMasqueradeMark       = 0x4000
+	KubeProxyMasqueradeMarkString = "0x4000"
 )
 
 // Protocol defines the ip protocol either ipv4 or ipv6
@@ -65,11 +73,16 @@ type Manager struct {
 	executor utiliptables.Interface
 	helper   *extraliptables.IPTables
 
-	overlaySubnet  []*net.IPNet
-	underlaySubnet []*net.IPNet
-	nodeIPList     []net.IP
+	localClusterOverlaySubnets  []*net.IPNet
+	localClusterUnderlaySubnets []*net.IPNet
+	localUnderlaySubnets        []*net.IPNet
 
-	overlayIfName string
+	nodeIPList      []net.IP
+	localNodeIPList []net.IP
+	localPodIPList  []net.IP
+
+	overlayIfName      string
+	vlanForwardIfNames []string
 
 	protocol Protocol
 
@@ -78,9 +91,9 @@ type Manager struct {
 	upgradeWorkDone bool
 
 	// add cluster-mesh remote ips
-	remoteOverlaySubnet  []*net.IPNet
-	remoteUnderlaySubnet []*net.IPNet
-	remoteNodeIPList     []net.IP
+	remoteClusterOverlaySubnets  []*net.IPNet
+	remoteClusterUnderlaySubnets []*net.IPNet
+	remoteNodeIPList             []net.IP
 }
 
 func (mgr *Manager) lock() {
@@ -121,29 +134,36 @@ func CreateIPtablesManager(protocol Protocol) (*Manager, error) {
 		executor: iptInterface,
 		helper:   helper,
 
-		overlaySubnet:  []*net.IPNet{},
-		underlaySubnet: []*net.IPNet{},
-		nodeIPList:     []net.IP{},
+		localClusterOverlaySubnets:  []*net.IPNet{},
+		localClusterUnderlaySubnets: []*net.IPNet{},
+		localUnderlaySubnets:        []*net.IPNet{},
+		nodeIPList:                  []net.IP{},
+		localNodeIPList:             []net.IP{},
+		vlanForwardIfNames:          []string{},
 
 		protocol: protocol,
 		c:        make(chan struct{}, 1),
 
-		remoteOverlaySubnet:  []*net.IPNet{},
-		remoteUnderlaySubnet: []*net.IPNet{},
-		remoteNodeIPList:     []net.IP{},
+		remoteClusterOverlaySubnets:  []*net.IPNet{},
+		remoteClusterUnderlaySubnets: []*net.IPNet{},
+		remoteNodeIPList:             []net.IP{},
 	}
 
 	return mgr, nil
 }
 
 func (mgr *Manager) Reset() {
-	mgr.overlaySubnet = []*net.IPNet{}
-	mgr.underlaySubnet = []*net.IPNet{}
+	mgr.localClusterOverlaySubnets = []*net.IPNet{}
+	mgr.localClusterUnderlaySubnets = []*net.IPNet{}
+	mgr.localUnderlaySubnets = []*net.IPNet{}
 	mgr.nodeIPList = []net.IP{}
+	mgr.localNodeIPList = []net.IP{}
+	mgr.localPodIPList = []net.IP{}
+	mgr.vlanForwardIfNames = []string{}
 	mgr.overlayIfName = ""
 
-	mgr.remoteOverlaySubnet = []*net.IPNet{}
-	mgr.remoteUnderlaySubnet = []*net.IPNet{}
+	mgr.remoteClusterOverlaySubnets = []*net.IPNet{}
+	mgr.remoteClusterUnderlaySubnets = []*net.IPNet{}
 	mgr.remoteNodeIPList = []net.IP{}
 }
 
@@ -151,11 +171,22 @@ func (mgr *Manager) RecordNodeIP(nodeIP net.IP) {
 	mgr.nodeIPList = append(mgr.nodeIPList, nodeIP)
 }
 
-func (mgr *Manager) RecordSubnet(subnetCidr *net.IPNet, isOverlay bool) {
+func (mgr *Manager) RecordLocalNodeIP(nodeIP net.IP) {
+	mgr.localNodeIPList = append(mgr.localNodeIPList, nodeIP)
+}
+
+func (mgr *Manager) RecordLocalPodIP(podIP net.IP) {
+	mgr.localPodIPList = append(mgr.localPodIPList, podIP)
+}
+
+func (mgr *Manager) RecordSubnet(subnetCidr *net.IPNet, isOverlay, isLocal bool) {
 	if isOverlay {
-		mgr.overlaySubnet = append(mgr.overlaySubnet, subnetCidr)
+		mgr.localClusterOverlaySubnets = append(mgr.localClusterOverlaySubnets, subnetCidr)
 	} else {
-		mgr.underlaySubnet = append(mgr.underlaySubnet, subnetCidr)
+		mgr.localClusterUnderlaySubnets = append(mgr.localClusterUnderlaySubnets, subnetCidr)
+		if isLocal {
+			mgr.localUnderlaySubnets = append(mgr.localUnderlaySubnets, subnetCidr)
+		}
 	}
 }
 
@@ -165,9 +196,9 @@ func (mgr *Manager) RecordRemoteNodeIP(nodeIP net.IP) {
 
 func (mgr *Manager) RecordRemoteSubnet(subnetCidr *net.IPNet, isOverlay bool) {
 	if isOverlay {
-		mgr.remoteOverlaySubnet = append(mgr.remoteOverlaySubnet, subnetCidr)
+		mgr.remoteClusterOverlaySubnets = append(mgr.remoteClusterOverlaySubnets, subnetCidr)
 	} else {
-		mgr.remoteUnderlaySubnet = append(mgr.remoteUnderlaySubnet, subnetCidr)
+		mgr.remoteClusterUnderlaySubnets = append(mgr.remoteClusterUnderlaySubnets, subnetCidr)
 	}
 }
 
@@ -175,58 +206,69 @@ func (mgr *Manager) SetOverlayIfName(overlayIfName string) {
 	mgr.overlayIfName = overlayIfName
 }
 
+func (mgr *Manager) RecordVlanForwardIfName(vlanForwardIfName string) {
+	// deduplication
+	for i := range mgr.vlanForwardIfNames {
+		if vlanForwardIfName == mgr.vlanForwardIfNames[i] {
+			return
+		}
+	}
+	mgr.vlanForwardIfNames = append(mgr.vlanForwardIfNames, vlanForwardIfName)
+}
+
 func (mgr *Manager) SyncRules() error {
 	mgr.lock()
 	defer mgr.unlock()
 
-	var overlayIPNets []string
-	var nodeIPs []string
+	overlayIPNets := generateStringsFromIPNets(mgr.localClusterOverlaySubnets)
+	nodeIPs := generateStringsFromIPs(mgr.nodeIPList)
+	allIPNets := generateStringsFromIPNets(mgr.localClusterUnderlaySubnets)
 
-	for _, cidr := range mgr.overlaySubnet {
-		overlayIPNets = append(overlayIPNets, cidr.String())
-	}
-
-	var allIPNets []string
-	for _, cidr := range mgr.underlaySubnet {
-		allIPNets = append(allIPNets, cidr.String())
-	}
-
-	for _, ip := range mgr.nodeIPList {
-		nodeIPs = append(nodeIPs, ip.String())
-	}
+	localUnderlayIPNets := generateStringsFromIPNets(mgr.localUnderlaySubnets)
+	localPodIPs := generateStringsFromIPs(mgr.localPodIPList)
 
 	// remote subnets & nodes
-	for _, cidr := range mgr.remoteOverlaySubnet {
-		overlayIPNets = append(overlayIPNets, cidr.String())
-	}
-	for _, cidr := range mgr.remoteUnderlaySubnet {
-		allIPNets = append(allIPNets, cidr.String())
-	}
-	for _, ip := range mgr.remoteNodeIPList {
-		nodeIPs = append(nodeIPs, ip.String())
-	}
+	overlayIPNets = append(overlayIPNets, generateStringsFromIPNets(mgr.remoteClusterOverlaySubnets)...)
+	allIPNets = append(allIPNets, generateStringsFromIPNets(mgr.remoteClusterUnderlaySubnets)...)
+	nodeIPs = append(nodeIPs, generateStringsFromIPs(mgr.remoteNodeIPList)...)
 
 	allIPNets = append(allIPNets, overlayIPNets...)
 	allIPNets = append(allIPNets, nodeIPs...)
 
-	ipsetInterface, err := ipset.New(mgr.protocol == ProtocolIpv6)
+	ipsetInterface, err := ipset.NewIPSet(mgr.protocol == ProtocolIpv6)
 	if err != nil {
 		return fmt.Errorf("failed to create ipset instance: %v", err)
 	}
 
-	if err := ipsetInterface.LoadData(); err != nil {
-		return fmt.Errorf("failed to load ipset data: %v", err)
+	var overlayNetSet, allIPSet, nodeIPSet, localUnderlayNetSet, localPodIPSet *ipset.Set
+
+	if overlayNetSet, err = createAndRefreshIPSet(ipsetInterface, HybridnetOverlayNetSetName, overlayIPNets,
+		ipset.TypeHashNet, ipset.OptionTimeout, "0"); err != nil {
+		return fmt.Errorf("failed to create and refresh ip set %v: %v", HybridnetOverlayNetSetName, err)
 	}
 
-	ipsetInterface.AddOrReplaceIPSet(generateIPSetNameByProtocol(HybridnetOverlayNetSetName, mgr.protocol),
-		overlayIPNets, ipset.TypeHashNet, ipset.OptionTimeout, "0")
-	ipsetInterface.AddOrReplaceIPSet(generateIPSetNameByProtocol(HybridnetAllIPSetName, mgr.protocol),
-		allIPNets, ipset.TypeHashNet, ipset.OptionTimeout, "0")
-	ipsetInterface.AddOrReplaceIPSet(generateIPSetNameByProtocol(HybridnetNodeIPSetName, mgr.protocol),
-		nodeIPs, ipset.TypeHashIP, ipset.OptionTimeout, "0")
+	if allIPSet, err = createAndRefreshIPSet(ipsetInterface, HybridnetAllIPSetName, allIPNets,
+		ipset.TypeHashNet, ipset.OptionTimeout, "0"); err != nil {
+		return fmt.Errorf("failed to create and refresh ip set %v: %v", HybridnetAllIPSetName, err)
+	}
+
+	if nodeIPSet, err = createAndRefreshIPSet(ipsetInterface, HybridnetNodeIPSetName, nodeIPs,
+		ipset.TypeHashIP, ipset.OptionTimeout, "0"); err != nil {
+		return fmt.Errorf("failed to create and refresh ip set %v: %v", HybridnetNodeIPSetName, err)
+	}
+
+	if localUnderlayNetSet, err = createAndRefreshIPSet(ipsetInterface, HybridnetLocalUnderlayNetSetName, localUnderlayIPNets,
+		ipset.TypeHashNet, ipset.OptionTimeout, "0"); err != nil {
+		return fmt.Errorf("failed to create and refresh ip set %v: %v", HybridnetLocalUnderlayNetSetName, err)
+	}
+
+	if localPodIPSet, err = createAndRefreshIPSet(ipsetInterface, HybridnetLocalPodIPSetName, localPodIPs,
+		ipset.TypeHashIP, ipset.OptionTimeout, "0"); err != nil {
+		return fmt.Errorf("failed to create and refresh ip set %v: %v", HybridnetLocalPodIPSetName, err)
+	}
 
 	if err := mgr.ensureBasicRuleAndChains(); err != nil {
-		return fmt.Errorf("ensure basic rules and chains failed: %v", err)
+		return fmt.Errorf("failed to ensure basic rules and chains: %v", err)
 	}
 
 	iptablesData := bytes.NewBuffer(nil)
@@ -246,8 +288,10 @@ func (mgr *Manager) SyncRules() error {
 	writeLine(filterChains, utiliptables.MakeChainLine(ChainHybridnetForward))
 	writeLine(mangleChains, utiliptables.MakeChainLine(ChainHybridnetPreRouting))
 	writeLine(mangleChains, utiliptables.MakeChainLine(ChainHybridnetPostRouting))
+	writeLine(mangleChains, utiliptables.MakeChainLine(ChainHybridnetFromRuleSkip))
+	writeLine(mangleChains, utiliptables.MakeChainLine(ChainHybridnetPodToNodeTrafficMark))
 
-	if mgr.overlayIfName != "" {
+	if len(mgr.overlayIfName) != 0 {
 		// There might be two scenarios where overlayIfName is nil
 		// 1. overlay network never exists
 		// 2. overlay network deleted after running for a period
@@ -256,21 +300,33 @@ func (mgr *Manager) SyncRules() error {
 		//
 		// Append rules.
 		writeLine(natRules, generateSkipMasqueradeRuleSpec()...)
-		writeLine(natRules, generateMasqueradeRuleSpec(mgr.overlayIfName, mgr.protocol)...)
-		writeLine(filterRules, generateVxlanFilterRuleSpec(mgr.overlayIfName, mgr.protocol)...)
-		writeLine(mangleRules, generateVxlanPodToNodeReplyMarkRuleSpec(mgr.protocol)...)
-		writeLine(mangleRules, generateVxlanPodToNodeReplyRemoveMarkRuleSpec(mgr.protocol)...)
+		writeLine(natRules, generateMasqueradeRuleSpec(mgr.overlayIfName, overlayNetSet.GetNameWithProtocol())...)
+		writeLine(filterRules, generateVxlanFilterRuleSpec(mgr.overlayIfName, allIPSet.GetNameWithProtocol(), mgr.protocol)...)
+		writeLine(mangleRules, generateVxlanPodToNodeReplyMarkRuleSpec(overlayNetSet.GetNameWithProtocol(),
+			nodeIPSet.GetNameWithProtocol())...)
+		writeLine(mangleRules, generateVxlanPodToNodeReplyRemoveMarkRuleSpec(overlayNetSet.GetNameWithProtocol(),
+			nodeIPSet.GetNameWithProtocol())...)
+		for _, localNodeIP := range mgr.localNodeIPList {
+			writeLine(mangleRules, generateLocalDNATedSkipRuleSpec(localNodeIP)...)
+		}
+		writeLine(mangleRules, generatePodToNodeMarkRuleSpec()...)
+	}
+
+	for i := range mgr.vlanForwardIfNames {
+		writeLine(filterRules, generateUnderlayEndLoopRuleSpec(mgr.vlanForwardIfNames[i], localPodIPSet.GetNameWithProtocol(),
+			localUnderlayNetSet.GetNameWithProtocol())...)
+	}
+
+	writeLine(mangleRules, generateFullNATMarkSNATRuleSpec()...)
+	// no need for remote subnets, because there are no "from" rules for them
+	for _, subnet := range append(mgr.localClusterUnderlaySubnets, mgr.localClusterOverlaySubnets...) {
+		writeLine(mangleRules, generateFullNATMarkDNATRuleSpec(subnet)...)
 	}
 
 	// Write the end-of-table markers
 	writeLine(natRules, "COMMIT")
 	writeLine(filterRules, "COMMIT")
 	writeLine(mangleRules, "COMMIT")
-
-	// Sync ipsets
-	if err := ipsetInterface.SyncOperations(); err != nil {
-		return fmt.Errorf("failed to execute sync ipset operations: %v", err)
-	}
 
 	// Sync rules
 	iptablesData.Write(natChains.Bytes())
@@ -300,52 +356,58 @@ func (mgr *Manager) SyncRules() error {
 func (mgr *Manager) ensureBasicRuleAndChains() error {
 	// ensure base chain and rule for HYBRIDNET-POSTROUTING in nat table
 	if _, err := mgr.executor.EnsureChain(TableNAT, ChainHybridnetPostRouting); err != nil {
-		return fmt.Errorf("ensule %v chain in %v table failed: %v", ChainHybridnetPostRouting, TableNAT, err)
+		return fmt.Errorf("failed to ensule %v chain in %v table: %v", ChainHybridnetPostRouting, TableNAT, err)
 	}
 
 	if _, err := mgr.executor.EnsureRule(utiliptables.Append, TableNAT, ChainPostRouting,
 		generateHybridnetPostRoutingBaseRuleSpec()...); err != nil {
-		return fmt.Errorf("ensure %v rule in %v table failed: %v", ChainHybridnetPostRouting, TableNAT, err)
+		return fmt.Errorf("failed to ensure %v rule in %v table: %v", ChainHybridnetPostRouting, TableNAT, err)
 	}
 
 	// ensure base chain and rule for HYBRIDNET-FORWARD in filter table
 	if _, err := mgr.executor.EnsureChain(TableFilter, ChainHybridnetForward); err != nil {
-		return fmt.Errorf("ensule %v chain in %v table failed: %v", ChainHybridnetForward, TableFilter, err)
+		return fmt.Errorf("failed to ensule %v chain in %v table: %v", ChainHybridnetForward, TableFilter, err)
 	}
 
 	if _, err := mgr.executor.EnsureRule(utiliptables.Append, TableFilter, ChainForward,
 		generateHybridnetForwardBaseRuleSpec()...); err != nil {
-		return fmt.Errorf("ensure %v rule in %v table failed: %v", ChainHybridnetForward, TableFilter, err)
+		return fmt.Errorf("failed to ensure %v rule in %v table: %v", ChainHybridnetForward, TableFilter, err)
 	}
 
 	// ensure base chain and rule for HYBRIDNET-PREROUTING in mangle table
 	if _, err := mgr.executor.EnsureChain(TableMangle, ChainHybridnetPreRouting); err != nil {
-		return fmt.Errorf("ensule %v chain in %v table failed: %v", ChainHybridnetPreRouting, TableMangle, err)
+		return fmt.Errorf("failed to ensule %v chain in %v table: %v", ChainHybridnetPreRouting, TableMangle, err)
 	}
 
 	if _, err := mgr.executor.EnsureRule(utiliptables.Append, TableMangle, ChainPreRouting,
 		generateHybridnetPreRoutingBaseRuleSpec()...); err != nil {
-		return fmt.Errorf("ensure %v rule in %v table failed: %v", ChainHybridnetPreRouting, TableMangle, err)
+		return fmt.Errorf("failed to ensure %v rule in %v table: %v", ChainHybridnetPreRouting, TableMangle, err)
 	}
 
 	// ensure base chain and rule for HYBRIDNET-POSTROUTING in mangle table
 	if _, err := mgr.executor.EnsureChain(TableMangle, ChainHybridnetPostRouting); err != nil {
-		return fmt.Errorf("ensule %v chain in %v table failed: %v", ChainHybridnetPostRouting, TableMangle, err)
+		return fmt.Errorf("failed to ensule %v chain in %v table: %v", ChainHybridnetPostRouting, TableMangle, err)
 	}
 
 	if _, err := mgr.executor.EnsureRule(utiliptables.Append, TableMangle, ChainPostRouting,
 		generateHybridnetPostRoutingBaseRuleSpec()...); err != nil {
-		return fmt.Errorf("ensure %v rule in %v table failed: %v", ChainHybridnetPostRouting, TableMangle, err)
+		return fmt.Errorf("failed to ensure %v rule in %v table: %v", ChainHybridnetPostRouting, TableMangle, err)
 	}
 
 	return nil
 }
 
-func generateIPSetNameByProtocol(setBaseName string, protocol Protocol) string {
-	if protocol == ProtocolIpv4 {
-		return setBaseName + "-V4"
+func createAndRefreshIPSet(ipsetInterface *ipset.IPSet, setName string, members []string, createOptions ...string) (*ipset.Set, error) {
+	set, err := ipsetInterface.Create(setName, createOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ip set: %v", err)
 	}
-	return setBaseName + "-V6"
+
+	if err = set.Refresh(members); err != nil {
+		return nil, fmt.Errorf("failed to refresh ip set: %v", err)
+	}
+
+	return set, nil
 }
 
 func generateHybridnetPostRoutingBaseRuleSpec() []string {
@@ -360,10 +422,9 @@ func generateHybridnetPreRoutingBaseRuleSpec() []string {
 	return []string{"-m", "comment", "--comment", "hybridnet prerouting rules", "-j", ChainHybridnetPreRouting}
 }
 
-func generateMasqueradeRuleSpec(vxlanIf string, protocol Protocol) []string {
+func generateMasqueradeRuleSpec(vxlanIf, overlayNetSet string) []string {
 	return []string{"-A", ChainHybridnetPostRouting, "-m", "comment", "--comment", `"hybridnet overlay nat-outgoing masquerade rule"`,
-		"!", "-o", vxlanIf, "-m", "set", "--match-set", generateIPSetNameByProtocol(HybridnetOverlayNetSetName, protocol),
-		"src", "-j", "MASQUERADE"}
+		"!", "-o", vxlanIf, "-m", "set", "--match-set", overlayNetSet, "src", "-j", "MASQUERADE"}
 }
 
 func generateSkipMasqueradeRuleSpec() []string {
@@ -371,29 +432,84 @@ func generateSkipMasqueradeRuleSpec() []string {
 		"-o", containernetwork.ContainerHostLinkPrefix + "+", "-j", "RETURN"}
 }
 
-func generateVxlanFilterRuleSpec(vxlanIf string, protocol Protocol) []string {
-	return []string{"-A", ChainHybridnetForward, "-m", "comment", "--comment", `"hybridnet overlay vxlan if egress filter rule"`,
-		"-o", vxlanIf, "-m", "set", "!", "--match-set", generateIPSetNameByProtocol(HybridnetAllIPSetName, protocol),
-		"dst", "-j", "REJECT", "--reject-with", rejectWithOption(protocol)}
+// TODO: update logic, need to be removed further
+func generateOldSkipMasqueradeRuleSpec() []string {
+	return []string{"-A", ChainHybridnetPostRouting, "-m", "comment", "--comment", `"skip masquerade if traffic is to exist old local pod"`,
+		"-o", "h_+", "-j", "RETURN"}
 }
 
-func generateVxlanPodToNodeReplyMarkRuleSpec(protocol Protocol) []string {
+// ensure stateful firewall
+func generateVxlanFilterRuleSpec(vxlanIf, allIPSet string, protocol Protocol) []string {
+	return []string{"-A", ChainHybridnetForward, "-m", "comment", "--comment", `"hybridnet overlay vxlan if egress filter rule"`,
+		"-o", vxlanIf, "-m", "set", "!", "--match-set", allIPSet, "dst",
+		"-m", "conntrack", "!", "--ctstate", "RELATED,ESTABLISHED",
+		"-j", "REJECT", "--reject-with", rejectWithOption(protocol)}
+}
+
+// pod -> node traffic cannot be made to overlay by iptables (because of the DNAT operation on service datapath)
+// this rule is used to make sure the connection from node to pod is ok.
+func generateVxlanPodToNodeReplyMarkRuleSpec(overlayNetSet, nodeIPSet string) []string {
 	return []string{"-A", ChainHybridnetPreRouting, "-m", "comment", "--comment", `"mark overlay pod -> node back traffic"`,
 		"-m", "addrtype", "!", "--dst-type", "LOCAL",
-		"-m", "set", "--match-set", generateIPSetNameByProtocol(HybridnetOverlayNetSetName, protocol), "src",
-		"-m", "set", "--match-set", generateIPSetNameByProtocol(HybridnetNodeIPSetName, protocol), "dst",
+		"-m", "set", "--match-set", overlayNetSet, "src",
+		"-m", "set", "--match-set", nodeIPSet, "dst",
 		"-m", "conntrack", "!", "--ctstate", "NEW,INVALID,DNAT,SNAT",
+		"-j", ChainHybridnetPodToNodeTrafficMark,
+	}
+}
+
+func generatePodToNodeMarkRuleSpec() []string {
+	return []string{"-A", ChainHybridnetPodToNodeTrafficMark, "-m", "comment", "--comment", `"do pod -> node traffic mark"`,
 		"-j", "MARK", "--set-xmark", fmt.Sprintf("%s/%s", PodToNodeBackTrafficMarkString, PodToNodeBackTrafficMarkString),
 	}
 }
 
-func generateVxlanPodToNodeReplyRemoveMarkRuleSpec(protocol Protocol) []string {
+// if pod -> node traffic is for svc with "externalTrafficPolicy: Local" do not mark it as overlay
+// TODO: this need to be retained if we use node ip routes to build the pod -> node traffic
+func generateLocalDNATedSkipRuleSpec(localNodeIP net.IP) []string {
+	return []string{"-A", ChainHybridnetPodToNodeTrafficMark, "-m", "comment", "--comment", `"do not mark DNATed traffic"`,
+		"-m", "conntrack", "--ctorigdst", localNodeIP.String(),
+		"-j", "RETURN",
+	}
+}
+
+func generateVxlanPodToNodeReplyRemoveMarkRuleSpec(overlayNetSet, nodeIPSet string) []string {
 	return []string{"-A", ChainHybridnetPostRouting, "-m", "comment", "--comment", `"remove overlay pod -> node back traffic mark"`,
 		"-m", "addrtype", "!", "--dst-type", "LOCAL",
-		"-m", "set", "--match-set", generateIPSetNameByProtocol(HybridnetOverlayNetSetName, protocol), "src",
-		"-m", "set", "--match-set", generateIPSetNameByProtocol(HybridnetNodeIPSetName, protocol), "dst",
+		"-m", "set", "--match-set", overlayNetSet, "src",
+		"-m", "set", "--match-set", nodeIPSet, "dst",
 		"-m", "conntrack", "!", "--ctstate", "NEW,INVALID,DNAT,SNAT",
 		"-j", "MARK", "--set-xmark", fmt.Sprintf("0x0/%s", PodToNodeBackTrafficMarkString),
+	}
+}
+
+// prefix of veth in host network is h_
+// drop packet which satisfies the following conditions:
+// 1. incoming from vlan-Forward NetworkInterface
+// 2. not outgoing to NetworkInterface with prefix h_
+// 3. not marked by kube-proxy
+// 4. destination ip belongs to underlay network
+func generateUnderlayEndLoopRuleSpec(underlayIf, localPodIPSet, localUnderlayNetSet string) []string {
+	return []string{"-A", ChainHybridnetForward, "-m", "comment", "--comment", `"drop endless underlay traffic because of route loop"`,
+		"-i", underlayIf,
+		"!", "-o", containernetwork.ContainerHostLinkPrefix + "+",
+		"-m", "mark", "!", "--mark", fmt.Sprintf("%s/%s", KubeProxyMasqueradeMarkString, KubeProxyMasqueradeMarkString),
+		"-m", "set", "--match-set", localUnderlayNetSet, "dst",
+		"-j", "DROP",
+	}
+}
+
+func generateFullNATMarkSNATRuleSpec() []string {
+	return []string{"-A", ChainHybridnetPreRouting, "-m", "comment", "--comment", `"match full NATed pod traffic"`,
+		"-m", "conntrack", "--ctstate", "SNAT",
+		"-j", ChainHybridnetFromRuleSkip,
+	}
+}
+
+func generateFullNATMarkDNATRuleSpec(cidr *net.IPNet) []string {
+	return []string{"-A", ChainHybridnetFromRuleSkip, "-m", "conntrack", "--ctstate", "DNAT",
+		"--ctreplsrc", cidr.String(), "-j", "MARK", "--set-xmark", fmt.Sprintf("%s/%s",
+			FullNATedPodTrafficMarkString, FullNATedPodTrafficMarkString),
 	}
 }
 

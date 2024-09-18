@@ -43,6 +43,7 @@ import (
 	"golang.org/x/sys/unix"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	corev1 "k8s.io/client-go/listers/core/v1"
@@ -600,79 +601,125 @@ func (c *Controller) iptablesSyncLoop() {
 					}
 				}
 			}
+		}
 
-			// Record subnet cidr.
-			subnetList, err := c.subnetLister.List(labels.Everything())
+		ipInstanceList, err := c.ipInstanceLister.List(labels.SelectorFromSet(map[string]string{constants.LabelNode: c.config.NodeName}))
+		if err != nil {
+			return fmt.Errorf("failed to list pod ip instances of node %v: %v", c.config.NodeName, err)
+		}
+		for _, ipInstance := range ipInstanceList {
+			// skip terminating ip instance
+			if ipInstance.DeletionTimestamp != nil {
+				continue
+			}
+
+			podIP, _, err := net.ParseCIDR(ipInstance.Spec.Address.IP)
 			if err != nil {
-				return fmt.Errorf("list subnet failed: %v", err)
+				return fmt.Errorf("parse pod ip %v error: %v", ipInstance.Spec.Address.IP, err)
 			}
 
-			for _, subnet := range subnetList {
-				_, cidr, err := net.ParseCIDR(subnet.Spec.Range.CIDR)
-				if err != nil {
-					return fmt.Errorf("parse subnet cidr %v failed: %v", subnet.Spec.Range.CIDR, err)
-				}
-
-				network, err := c.networkLister.Get(subnet.Spec.Network)
-				if err != nil {
-					return fmt.Errorf("failed to get network for subnet %v", subnet.Name)
-				}
-
-				iptablesManager := c.getIPtablesManager(subnet.Spec.Range.Version)
-				iptablesManager.RecordSubnet(cidr, networkingv1.GetNetworkType(network) == networkingv1.NetworkTypeOverlay)
+			subnet, err := c.subnetLister.Get(ipInstance.Spec.Subnet)
+			if err != nil {
+				return fmt.Errorf("failed to get subnet for ipinstance %s: %v", ipInstance.Name, err)
+			}
+			reservedIPs := sets.NewString(subnet.Spec.Range.ReservedIPs...)
+			// skip reserved ip instance
+			if reservedIPs.Has(podIP.String()) {
+				continue
 			}
 
-			if feature.MultiClusterEnabled() {
-				// If remote overlay network des not exist, the rcmanager will not fetch
-				// RemoteSubnet and RemoteVtep. Thus, existence check is redundant here.
+			if podIP.To4() == nil {
+				c.iptablesV6Manager.RecordLocalPodIP(podIP)
+			} else {
+				c.iptablesV4Manager.RecordLocalPodIP(podIP)
+			}
+		}
+		// Record subnet cidr.
+		subnetList, err := c.subnetLister.List(labels.Everything())
+		if err != nil {
+			return fmt.Errorf("list subnet failed: %v", err)
+		}
 
-				remoteSubnetList, err := c.remoteSubnetLister.List(labels.Everything())
+		for _, subnet := range subnetList {
+			_, cidr, err := net.ParseCIDR(subnet.Spec.Range.CIDR)
+			if err != nil {
+				return fmt.Errorf("parse subnet cidr %v failed: %v", subnet.Spec.Range.CIDR, err)
+			}
+
+			network, err := c.networkLister.Get(subnet.Spec.Network)
+			if err != nil {
+				return fmt.Errorf("failed to get network for subnet %v", subnet.Name)
+			}
+
+			iptablesManager := c.getIPtablesManager(subnet.Spec.Range.Version)
+			// isLocal means whether this node belongs to this network
+			isLocal := nodeBelongsToNetwork(c.config.NodeName, network)
+			// if network is local vlan, record vlan forward interface names
+			if isLocal && networkingv1.GetNetworkType(network) == networkingv1.NetworkTypeUnderlay {
+				netID := subnet.Spec.NetID
+				if netID == nil {
+					netID = network.Spec.NetID
+				}
+
+				if vlanForwardIfName, err := containernetwork.GenerateVlanNetIfName(c.config.NodeVlanIfName, netID); err == nil {
+					iptablesManager.RecordVlanForwardIfName(vlanForwardIfName)
+				} else {
+					return fmt.Errorf("failed to generate vlan %d net interface name with node vlan name %s, err: %v", *netID, c.config.NodeVlanIfName, err)
+				}
+			}
+			iptablesManager.RecordSubnet(cidr, networkingv1.GetNetworkType(network) == networkingv1.NetworkTypeOverlay, isLocal)
+		}
+
+		if feature.MultiClusterEnabled() {
+			// If remote overlay network des not exist, the rcmanager will not fetch
+			// RemoteSubnet and RemoteVtep. Thus, existence check is redundant here.
+
+			remoteSubnetList, err := c.remoteSubnetLister.List(labels.Everything())
+			if err != nil {
+				return fmt.Errorf("list remote network failed: %v", err)
+			}
+
+			// Record remote vtep ip.
+			vtepList, err := c.remoteVtepLister.List(labels.Everything())
+			if err != nil {
+				return fmt.Errorf("list remote vtep failed: %v", err)
+			}
+
+			for _, vtep := range vtepList {
+				if _, exist := vtep.Annotations[constants.AnnotationNodeLocalVxlanIPList]; !exist {
+					ip := net.ParseIP(vtep.Spec.VtepIP)
+					if ip.To4() != nil {
+						// v4 address
+						c.iptablesV4Manager.RecordRemoteNodeIP(ip)
+					} else {
+						// v6 address
+						c.iptablesV6Manager.RecordRemoteNodeIP(ip)
+					}
+					continue
+				}
+
+				nodeLocalVxlanIPStringList := strings.Split(vtep.Annotations[constants.AnnotationNodeLocalVxlanIPList], ",")
+				for _, ipString := range nodeLocalVxlanIPStringList {
+					ip := net.ParseIP(ipString)
+					if ip.To4() != nil {
+						// v4 address
+						c.iptablesV4Manager.RecordRemoteNodeIP(ip)
+					} else {
+						// v6 address
+						c.iptablesV6Manager.RecordRemoteNodeIP(ip)
+					}
+				}
+			}
+
+			// Record remote subnet cidr
+			for _, remoteSubnet := range remoteSubnetList {
+				_, cidr, err := net.ParseCIDR(remoteSubnet.Spec.Range.CIDR)
 				if err != nil {
-					return fmt.Errorf("list remote network failed: %v", err)
+					return fmt.Errorf("parse remote subnet cidr %v failed: %v", remoteSubnet.Spec.Range.CIDR, err)
 				}
 
-				// Record remote vtep ip.
-				vtepList, err := c.remoteVtepLister.List(labels.Everything())
-				if err != nil {
-					return fmt.Errorf("list remote vtep failed: %v", err)
-				}
-
-				for _, vtep := range vtepList {
-					if _, exist := vtep.Annotations[constants.AnnotationNodeLocalVxlanIPList]; !exist {
-						ip := net.ParseIP(vtep.Spec.VtepIP)
-						if ip.To4() != nil {
-							// v4 address
-							c.iptablesV4Manager.RecordRemoteNodeIP(ip)
-						} else {
-							// v6 address
-							c.iptablesV6Manager.RecordRemoteNodeIP(ip)
-						}
-						continue
-					}
-
-					nodeLocalVxlanIPStringList := strings.Split(vtep.Annotations[constants.AnnotationNodeLocalVxlanIPList], ",")
-					for _, ipString := range nodeLocalVxlanIPStringList {
-						ip := net.ParseIP(ipString)
-						if ip.To4() != nil {
-							// v4 address
-							c.iptablesV4Manager.RecordRemoteNodeIP(ip)
-						} else {
-							// v6 address
-							c.iptablesV6Manager.RecordRemoteNodeIP(ip)
-						}
-					}
-				}
-
-				// Record remote subnet cidr
-				for _, remoteSubnet := range remoteSubnetList {
-					_, cidr, err := net.ParseCIDR(remoteSubnet.Spec.Range.CIDR)
-					if err != nil {
-						return fmt.Errorf("parse remote subnet cidr %v failed: %v", remoteSubnet.Spec.Range.CIDR, err)
-					}
-
-					c.getIPtablesManager(remoteSubnet.Spec.Range.Version).
-						RecordRemoteSubnet(cidr, networkingv1.GetRemoteSubnetType(remoteSubnet) == networkingv1.NetworkTypeOverlay)
-				}
+				c.getIPtablesManager(remoteSubnet.Spec.Range.Version).
+					RecordRemoteSubnet(cidr, networkingv1.GetRemoteSubnetType(remoteSubnet) == networkingv1.NetworkTypeOverlay)
 			}
 		}
 

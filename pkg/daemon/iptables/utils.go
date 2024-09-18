@@ -16,7 +16,10 @@
 
 package iptables
 
-import "bytes"
+import (
+	"bytes"
+	"net"
+)
 
 // Join all words with spaces, terminate with newline and write to buf.
 func writeLine(buf *bytes.Buffer, words ...string) {
@@ -29,4 +32,20 @@ func writeLine(buf *bytes.Buffer, words ...string) {
 			buf.WriteByte('\n')
 		}
 	}
+}
+
+func generateStringsFromIPNets(ipNets []*net.IPNet) []string {
+	var ipNetStrings []string
+	for _, cidr := range ipNets {
+		ipNetStrings = append(ipNetStrings, cidr.String())
+	}
+	return ipNetStrings
+}
+
+func generateStringsFromIPs(ips []net.IP) []string {
+	var ipStrings []string
+	for _, ipAddr := range ips {
+		ipStrings = append(ipStrings, ipAddr.String())
+	}
+	return ipStrings
 }

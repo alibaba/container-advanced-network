@@ -211,3 +211,17 @@ func isIPListEqual(a, b []string) bool {
 
 	return gset.NewStrSetFrom(a).Equal(gset.NewStrSetFrom(b))
 }
+
+func nodeBelongsToNetwork(nodeName string, network *networkingv1.Network) bool {
+	if networkingv1.GetNetworkType(network) == networkingv1.NetworkTypeOverlay {
+		return true
+	}
+	isUnderlayOnHost := false
+	for _, n := range network.Status.NodeList {
+		if n == nodeName {
+			isUnderlayOnHost = true
+			break
+		}
+	}
+	return isUnderlayOnHost
+}
